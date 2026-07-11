@@ -756,7 +756,7 @@ function startNet() {
 }
 
 /* ================= remote avatars ================= */
-const avatars = {};   // id -> {group, head, target, name}
+const avatars = {};   // id -> {group, limbs, phase, amp, target}
 function nameSprite(name, colorHex) {
   const c = document.createElement('canvas'); c.width = 256; c.height = 64;
   const g = c.getContext('2d');
@@ -770,24 +770,105 @@ function nameSprite(name, colorHex) {
   s.scale.set(2.2, 0.55, 1);
   return s;
 }
+// one look per player colour: outfit + shoes + hair + eye colour
+const OUTFITS = [
+  { style: 'hoodie',   top: '#e2574c', bottom: '#39406b', shoes: '#2b2620', skin: '#ffd9b8', hair: '#e2574c', iris: '#7a4230' },
+  { style: 'overalls', top: '#4c8be2', bottom: '#2e4670', shoes: '#f2e8d0', skin: '#ffe2c4', hair: '#2f2f38', iris: '#3a6fd8' },
+  { style: 'dress',    top: '#e8c04a', bottom: '#8a5a2e', shoes: '#7a3b34', skin: '#ffd9b8', hair: '#c9803d', iris: '#4e8a2e' },
+  { style: 'cape',     top: '#9a5ce2', bottom: '#332648', shoes: '#e2e2ea', skin: '#ffe6cf', hair: '#563a8f', iris: '#8a4ce2' },
+];
+
+function faceCanvas(o) {   // anime-style face: big eyes, brows, blush, tiny smile
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  function ell(x, y, rx, ry) { g.beginPath(); g.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); g.fill(); }
+  g.fillStyle = o.skin; g.fillRect(0, 0, 64, 64);
+  // bangs across the forehead (hood rim on the hoodie look)
+  g.fillStyle = o.style === 'hoodie' ? o.top : o.hair;
+  g.fillRect(0, 0, 64, 9);
+  for (let i = 0; i < 8; i++) {
+    g.beginPath(); g.moveTo(i * 8, 9); g.lineTo(i * 8 + 4, i % 2 ? 17 : 13); g.lineTo(i * 8 + 8, 9); g.fill();
+  }
+  const eye = cx => {
+    g.fillStyle = '#2b2118'; ell(cx, 34, 7.5, 10);            // outline
+    g.fillStyle = '#ffffff'; ell(cx, 34, 6, 8.5);             // sclera
+    g.fillStyle = o.iris;    ell(cx, 35.5, 4.6, 6.6);         // iris
+    g.fillStyle = 'rgba(0,0,0,.35)'; ell(cx, 32.5, 4.2, 4);   // iris shading
+    g.fillStyle = '#2b2118'; ell(cx, 36, 2.2, 3);             // pupil
+    g.fillStyle = '#ffffff'; ell(cx - 2, 31.5, 2.2, 2.6); ell(cx + 2.4, 38.5, 1.2, 1.4); // sparkles
+  };
+  eye(20); eye(44);
+  g.strokeStyle = '#3a2a1c'; g.lineWidth = 2;                 // brows
+  g.beginPath(); g.arc(20, 27, 6, Math.PI * 1.15, Math.PI * 1.85); g.stroke();
+  g.beginPath(); g.arc(44, 27, 6, Math.PI * 1.15, Math.PI * 1.85); g.stroke();
+  g.fillStyle = 'rgba(255,120,120,.5)'; ell(9, 45, 4.5, 2.4); ell(55, 45, 4.5, 2.4); // blush
+  g.strokeStyle = '#a34a3a'; g.lineWidth = 2.2;               // open smile
+  g.beginPath(); g.arc(32, 48, 5, Math.PI * 0.15, Math.PI * 0.85); g.stroke();
+  g.fillStyle = '#e2857f'; g.beginPath(); g.arc(32, 50, 2.4, 0, Math.PI); g.fill();
+  return c;
+}
+
+function buildAvatar(cIdx) {
+  const o = OUTFITS[cIdx % OUTFITS.length];
+  const group = new THREE.Group();
+  const mat = c => new THREE.MeshLambertMaterial({ color: new THREE.Color(c) });
+  const skinM = mat(o.skin), topM = mat(o.top), botM = mat(o.bottom), shoeM = mat(o.shoes), hairM = mat(o.hair);
+  const add = (parent, w, h, d, m, x, y, z) => {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+    mesh.position.set(x, y, z); parent.add(mesh); return mesh;
+  };
+  // legs + shoes, pivoted at the hip so they can swing
+  const mkLeg = sx => {
+    const lg = new THREE.Group(); lg.position.set(sx, 0.72, 0);
+    add(lg, 0.2, 0.6, 0.24, botM, 0, -0.3, 0);
+    add(lg, 0.22, 0.13, 0.3, shoeM, 0, -0.57, -0.05);   // shoe, toe forward
+    group.add(lg); return lg;
+  };
+  const legL = mkLeg(-0.15), legR = mkLeg(0.15);
+  // torso
+  if (o.style === 'overalls') {
+    add(group, 0.6, 0.3, 0.34, topM, 0, 1.15, 0);
+    add(group, 0.62, 0.3, 0.36, botM, 0, 0.87, 0);      // bib
+  } else {
+    add(group, 0.6, 0.58, 0.34, topM, 0, 1.01, 0);
+  }
+  if (o.style === 'dress') add(group, 0.72, 0.28, 0.44, topM, 0, 0.7, 0);     // skirt
+  if (o.style === 'cape') add(group, 0.56, 0.85, 0.07, botM, 0, 0.92, 0.22);  // cape on the back
+  // arms with skin hands, pivoted at the shoulder
+  const mkArm = sx => {
+    const ag = new THREE.Group(); ag.position.set(sx, 1.27, 0);
+    add(ag, 0.17, 0.34, 0.18, topM, 0, -0.17, 0);
+    add(ag, 0.15, 0.18, 0.15, skinM, 0, -0.42, 0);
+    group.add(ag); return ag;
+  };
+  const armL = mkArm(-0.39), armR = mkArm(0.39);
+  // head, anime face on the front (-z)
+  const faceM = new THREE.MeshLambertMaterial({ map: tex(faceCanvas(o)) });
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.52, 0.52),
+    [skinM, skinM, skinM, skinM, skinM, faceM]);
+  head.position.y = 1.56;
+  group.add(head);
+  // hair (hood on the hoodie look; long in the back for the dress look)
+  const hm = o.style === 'hoodie' ? topM : hairM;
+  add(group, 0.58, 0.14, 0.58, hm, 0, 1.8, 0);
+  add(group, 0.58, o.style === 'dress' ? 0.62 : 0.34, 0.12, hm,
+      0, o.style === 'dress' ? 1.5 : 1.62, 0.27);
+  return { group, limbs: { legL, legR, armL, armR } };
+}
+
 function upsertAvatar(id, p) {
   let a = avatars[id];
   if (!a) {
-    const colorHex = AVATAR_COLORS[p.c % AVATAR_COLORS.length];
-    const col = new THREE.Color(colorHex);
-    const group = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.95, 0.34), new THREE.MeshLambertMaterial({ color: col }));
-    body.position.y = 0.475 + 0.28;
-    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.28, 0.3), new THREE.MeshLambertMaterial({ color: col.clone().multiplyScalar(0.55) }));
-    legs.position.y = 0.14;
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), new THREE.MeshLambertMaterial({ color: col.clone().lerp(new THREE.Color(0xffe6c8), 0.55) }));
-    head.position.y = 1.28 + 0.25;
-    const label = nameSprite(p.n, colorHex);
+    const built = buildAvatar(p.c);
+    const label = nameSprite(p.n, AVATAR_COLORS[p.c % AVATAR_COLORS.length]);
     label.position.y = 2.15;
-    group.add(body, legs, head, label);
-    scene.add(group);
-    a = avatars[id] = { group, head, target: { x: p.x, y: p.y, z: p.z, ry: p.ry } };
-    group.position.set(p.x, p.y, p.z);
+    built.group.add(label);
+    scene.add(built.group);
+    a = avatars[id] = {
+      group: built.group, limbs: built.limbs, phase: 0, amp: 0,
+      target: { x: p.x, y: p.y, z: p.z, ry: p.ry },
+    };
+    built.group.position.set(p.x, p.y, p.z);
   }
   a.target = { x: p.x, y: p.y, z: p.z, ry: p.ry };
 }
@@ -799,6 +880,7 @@ function tickAvatars(dt) {
   const k = 1 - Math.exp(-8 * dt);
   for (const id in avatars) {
     const a = avatars[id], g = a.group, t = a.target;
+    const ox = g.position.x, oz = g.position.z;
     g.position.x += (t.x - g.position.x) * k;
     g.position.y += (t.y - g.position.y) * k;
     g.position.z += (t.z - g.position.z) * k;
@@ -806,6 +888,16 @@ function tickAvatars(dt) {
     while (d > Math.PI) d -= Math.PI * 2;
     while (d < -Math.PI) d += Math.PI * 2;
     g.rotation.y += d * k;
+    // limbs swing while walking, settle when standing
+    const moved = Math.hypot(g.position.x - ox, g.position.z - oz);
+    const speed = dt > 0 ? moved / dt : 0;
+    a.amp += (Math.min(speed / 4, 1) - a.amp) * Math.min(1, 6 * dt);
+    a.phase += moved * 7;
+    const s = Math.sin(a.phase) * 0.8 * a.amp;
+    a.limbs.legL.rotation.x = s;
+    a.limbs.legR.rotation.x = -s;
+    a.limbs.armL.rotation.x = -s * 0.8;
+    a.limbs.armR.rotation.x = s * 0.8;
   }
 }
 
