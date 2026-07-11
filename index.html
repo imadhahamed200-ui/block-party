@@ -135,6 +135,11 @@
     position:absolute;right:26px;bottom:96px;width:64px;height:64px;border-radius:50%;
     font-size:22px;padding:0;
   }
+  #downBtn{
+    position:absolute;right:104px;bottom:88px;width:52px;height:52px;border-radius:50%;
+    font-size:18px;padding:0;display:none;
+  }
+  body.touch.flying #downBtn{display:block;}
   .touchOnly{display:none;}
   body.touch .touchOnly{display:block;}
   body.touch #hint{display:none;}
@@ -174,16 +179,20 @@
         <div class="phead">Builders <span id="pCount"></span></div>
         <div id="playersList"></div>
       </div>
-      <button id="muteBtn" class="ghostbtn" aria-label="Toggle sound">&#128266;</button>
+      <div style="display:flex;gap:8px;">
+        <button id="nightBtn" class="ghostbtn" aria-label="Toggle day and night">&#127769;</button>
+        <button id="muteBtn" class="ghostbtn" aria-label="Toggle sound">&#128266;</button>
+      </div>
     </div>
     <div id="blockName"></div>
     <div id="hotbar" class="panel"></div>
-    <div id="hint">WASD move &middot; Space jump &middot; mouse look<br>
-      Left-click break &middot; Right-click place &middot; middle-click pick<br>
-      1&ndash;0 / scroll picks a block</div>
+    <div id="hint">WASD move &middot; Space jump &middot; double-tap Space to fly (Shift = down)<br>
+      Left-click break &middot; Right-click place / use doors &amp; TNT<br>
+      1&ndash;0 / scroll picks a block &middot; middle-click copies a block</div>
     <div id="toast" class="panel"></div>
     <div id="joy" class="touchOnly"><div id="joyKnob"></div></div>
-    <button id="jumpBtn" class="btn touchOnly" aria-label="Jump">&#9650;</button>
+    <button id="jumpBtn" class="btn touchOnly" aria-label="Jump / fly up">&#9650;</button>
+    <button id="downBtn" class="btn" aria-label="Fly down">&#9660;</button>
   </div>
 
   <div id="join">
@@ -330,6 +339,17 @@ const SFX = (() => {
     join()   { tone(524, 524, 0.09, 0.10, 'square'); setTimeout(() => tone(784, 784, 0.12, 0.10, 'square'), 100); },
     leave()  { tone(660, 330, 0.15, 0.08, 'square'); },
     denied() { tone(180, 140, 0.12, 0.10, 'square'); },
+    whoosh() { noise(0.28, 380, 1600, 0.14, 0.8); },
+    door(open) {
+      tone(open ? 170 : 230, open ? 240 : 160, 0.16, 0.09, 'sawtooth'); // creak
+      setTimeout(() => noise(0.06, 500, 250, 0.18, 1), open ? 20 : 110); // latch
+    },
+    fuse() { noise(1.35, 2800, 2200, 0.07, 0.6); },
+    boom() {
+      noise(0.55, 420, 55, 0.5, 0.7);
+      tone(95, 28, 0.5, 0.4, 'sine');
+      setTimeout(() => noise(0.35, 900, 200, 0.2, 0.6), 60);
+    },
     toggleMute() { muted = !muted; if (!muted) ensure(); return muted; }
   };
 })();
@@ -394,20 +414,139 @@ function lantern() {
   });
 }
 
-// side/top/bottom canvases per type; `snd` picks the sound family
+function tntTex(armed) {
+  return noiseCanvas(armed ? '#e2a2a2' : '#c8483c', 12, g => {
+    g.fillStyle = armed ? '#fff6d8' : '#e8e0d0';
+    g.fillRect(0, 5, 16, 6);
+    g.fillStyle = '#2b2118';
+    g.font = 'bold 6px monospace';
+    g.fillText('TNT', 2, 11);
+    g.fillStyle = armed ? '#ffdf70' : '#8a3a30';
+    g.fillRect(0, 0, 16, 1); g.fillRect(0, 15, 16, 1);
+  });
+}
+
+// furniture: boxes [w,h,d, x,y,z, color] merged into one geometry with
+// baked vertex colours; local space is the cell, centred on the origin
+function mergedBoxes(parts) {
+  const pos = [], norm = [], col = [], uv = [], idx = [];
+  let off = 0;
+  for (const [w, h, d, x, y, z, color] of parts) {
+    const g = new THREE.BoxGeometry(w, h, d);
+    g.translate(x, y, z);
+    const c = new THREE.Color(color);
+    const n = g.attributes.position.count;
+    pos.push(...g.attributes.position.array);
+    norm.push(...g.attributes.normal.array);
+    uv.push(...g.attributes.uv.array);
+    for (let i = 0; i < n; i++) col.push(c.r, c.g, c.b);
+    for (const i of g.index.array) idx.push(i + off);
+    off += n;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.Float32BufferAttribute(norm, 3));
+  out.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  out.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  out.setIndex(idx);
+  return out;
+}
+function iconCanvas(draw) {
+  const c = document.createElement('canvas'); c.width = c.height = 16;
+  draw(c.getContext('2d'));
+  return c;
+}
+const W_LIGHT = '#b08a52', W_MID = '#9a7544', W_DARK = '#8a6538';
+
+// `snd` picks the sound family; `tint` colours break/place particles.
+// Furniture types carry `geo`; `rotates` face the player when placed;
+// `tall` types fill the cell above too; `interact` = right-click/tap use.
 const TYPES = [
-  { id: 1,  name: 'Grass',  snd: 'soft',  side: grassSide(), top: noiseCanvas(GRASS_TOP, 14), bottom: noiseCanvas(DIRT, 14) },
-  { id: 2,  name: 'Dirt',   snd: 'soft',  side: noiseCanvas(DIRT, 14) },
-  { id: 3,  name: 'Stone',  snd: 'stone', side: noiseCanvas(STONE, 10) },
-  { id: 4,  name: 'Planks', snd: 'wood',  side: planks() },
-  { id: 5,  name: 'Log',    snd: 'wood',  side: noiseCanvas('#6b4a2a', 10, g => { g.fillStyle = 'rgba(40,25,12,.5)'; for (let x = 1; x < 16; x += 4) g.fillRect(x, 0, 1, 16); }), top: logTop() },
-  { id: 6,  name: 'Brick',  snd: 'stone', side: bricks() },
-  { id: 7,  name: 'Sand',   snd: 'sand',  side: noiseCanvas('#e3d29b', 12) },
-  { id: 8,  name: 'Leaves', snd: 'leaf',  side: noiseCanvas('#3e7d28', 22) },
-  { id: 9,  name: 'Glass',  snd: 'glass', side: glassPane(), transparent: true },
-  { id: 10, name: 'Lantern', snd: 'stone', side: lantern(), glow: true },
+  { id: 1,  name: 'Grass',  snd: 'soft',  tint: GRASS_TOP, side: grassSide(), top: noiseCanvas(GRASS_TOP, 14), bottom: noiseCanvas(DIRT, 14) },
+  { id: 2,  name: 'Dirt',   snd: 'soft',  tint: DIRT,      side: noiseCanvas(DIRT, 14) },
+  { id: 3,  name: 'Stone',  snd: 'stone', tint: STONE,     side: noiseCanvas(STONE, 10) },
+  { id: 4,  name: 'Planks', snd: 'wood',  tint: W_LIGHT,   side: planks() },
+  { id: 5,  name: 'Log',    snd: 'wood',  tint: '#6b4a2a', side: noiseCanvas('#6b4a2a', 10, g => { g.fillStyle = 'rgba(40,25,12,.5)'; for (let x = 1; x < 16; x += 4) g.fillRect(x, 0, 1, 16); }), top: logTop() },
+  { id: 6,  name: 'Brick',  snd: 'stone', tint: '#9c5040', side: bricks() },
+  { id: 7,  name: 'Sand',   snd: 'sand',  tint: '#e3d29b', side: noiseCanvas('#e3d29b', 12) },
+  { id: 8,  name: 'Leaves', snd: 'leaf',  tint: '#3e7d28', side: noiseCanvas('#3e7d28', 22) },
+  { id: 9,  name: 'Glass',  snd: 'glass', tint: '#cfe8f0', side: glassPane(), transparent: true },
+  { id: 10, name: 'Lantern', snd: 'stone', tint: '#e8b64a', side: lantern(), glow: true },
+  { id: 11, name: 'Pink wool', snd: 'leaf', tint: '#e290b8', side: noiseCanvas('#e290b8', 10) },
+  { id: 12, name: 'Teal wool', snd: 'leaf', tint: '#4fb8a8', side: noiseCanvas('#4fb8a8', 10) },
+  { id: 13, name: 'Door', snd: 'wood', tint: W_MID, rotates: true, tall: true,
+    geo: mergedBoxes([
+      [0.92, 1.9, 0.13, 0, 0.45, -0.42, W_MID],
+      [0.4, 0.34, 0.15, 0, 0.98, -0.42, '#cfe8f0'],
+      [0.09, 0.09, 0.17, 0.32, 0.42, -0.42, '#3a2e1c'],
+    ]),
+    icon: iconCanvas(g => { g.fillStyle = W_MID; g.fillRect(3, 1, 10, 14); g.fillStyle = '#cfe8f0'; g.fillRect(5, 3, 6, 4); g.fillStyle = '#3a2e1c'; g.fillRect(11, 8, 2, 2); }),
+    interact(cell, v) {
+      editBlock(cell[0], cell[1], cell[2], ID_DOOR_OPEN + TROT(v) * 256);
+      SFX.door(true);
+    } },
+  { id: 14, name: 'Door (open)', snd: 'wood', tint: W_MID, hidden: true, tall: true, solid: false,
+    geo: mergedBoxes([
+      [0.13, 1.9, 0.92, -0.415, 0.45, 0.04, W_MID],
+      [0.15, 0.34, 0.4, -0.415, 0.98, 0.04, '#cfe8f0'],
+      [0.17, 0.09, 0.09, -0.415, 0.42, 0.46, '#3a2e1c'],
+    ]),
+    interact(cell, v) {
+      editBlock(cell[0], cell[1], cell[2], ID_DOOR + TROT(v) * 256);
+      SFX.door(false);
+    } },
+  { id: 15, name: 'Table', snd: 'wood', tint: W_LIGHT,
+    geo: mergedBoxes([
+      [0.96, 0.1, 0.96, 0, 0.13, 0, W_LIGHT],
+      [0.1, 0.62, 0.1, -0.4, -0.19, -0.4, W_DARK], [0.1, 0.62, 0.1, 0.4, -0.19, -0.4, W_DARK],
+      [0.1, 0.62, 0.1, -0.4, -0.19, 0.4, W_DARK], [0.1, 0.62, 0.1, 0.4, -0.19, 0.4, W_DARK],
+    ]),
+    icon: iconCanvas(g => { g.fillStyle = W_LIGHT; g.fillRect(2, 5, 12, 2); g.fillStyle = W_DARK; g.fillRect(3, 7, 2, 7); g.fillRect(11, 7, 2, 7); }) },
+  { id: 16, name: 'Chair', snd: 'wood', tint: W_LIGHT, rotates: true,
+    geo: mergedBoxes([
+      [0.66, 0.09, 0.62, 0, -0.09, 0.02, W_LIGHT],
+      [0.66, 0.72, 0.09, 0, 0.27, 0.3, W_MID],
+      [0.09, 0.38, 0.09, -0.26, -0.31, -0.24, W_DARK], [0.09, 0.38, 0.09, 0.26, -0.31, -0.24, W_DARK],
+      [0.09, 0.38, 0.09, -0.26, -0.31, 0.24, W_DARK], [0.09, 0.38, 0.09, 0.26, -0.31, 0.24, W_DARK],
+    ]),
+    icon: iconCanvas(g => { g.fillStyle = W_MID; g.fillRect(10, 2, 2, 10); g.fillStyle = W_LIGHT; g.fillRect(3, 8, 9, 2); g.fillStyle = W_DARK; g.fillRect(3, 10, 2, 5); g.fillRect(10, 12, 2, 3); }) },
+  { id: 17, name: 'Bed', snd: 'wood', tint: '#c85a50', rotates: true,
+    geo: mergedBoxes([
+      [0.98, 0.28, 0.98, 0, -0.36, 0, W_DARK],
+      [0.92, 0.16, 0.92, 0, -0.15, 0, '#e0dcd2'],
+      [0.94, 0.1, 0.6, 0, -0.06, -0.17, '#c85a50'],
+      [0.7, 0.12, 0.26, 0, -0.04, 0.3, '#f5f2ea'],
+      [0.98, 0.5, 0.1, 0, -0.1, 0.46, W_DARK],
+    ]),
+    icon: iconCanvas(g => { g.fillStyle = W_DARK; g.fillRect(2, 12, 12, 2); g.fillStyle = '#c85a50'; g.fillRect(2, 8, 8, 4); g.fillStyle = '#f5f2ea'; g.fillRect(10, 7, 4, 5); }) },
+  { id: 18, name: 'Fence', snd: 'wood', tint: W_MID, rotates: true,
+    geo: mergedBoxes([
+      [0.16, 1, 0.16, 0, 0, 0, W_MID],
+      [1, 0.12, 0.09, 0, 0.28, 0, W_LIGHT],
+      [1, 0.12, 0.09, 0, -0.08, 0, W_LIGHT],
+    ]),
+    icon: iconCanvas(g => { g.fillStyle = W_MID; g.fillRect(7, 2, 2, 12); g.fillStyle = W_LIGHT; g.fillRect(2, 5, 12, 2); g.fillRect(2, 9, 12, 2); }) },
+  { id: 19, name: 'Flower', snd: 'leaf', tint: '#e290b8', solid: false,
+    geo: mergedBoxes([
+      [0.07, 0.5, 0.07, 0, -0.25, 0, '#4e8a2e'],
+      [0.2, 0.05, 0.1, 0.1, -0.32, 0, '#5da23a'],
+      [0.3, 0.26, 0.3, 0, 0.06, 0, '#e290b8'],
+      [0.14, 0.1, 0.14, 0, 0.24, 0, '#e8c04a'],
+    ]),
+    icon: iconCanvas(g => { g.fillStyle = '#4e8a2e'; g.fillRect(7, 8, 2, 7); g.fillStyle = '#e290b8'; g.fillRect(4, 2, 8, 7); g.fillStyle = '#e8c04a'; g.fillRect(7, 4, 2, 3); }) },
+  { id: 20, name: 'TNT', snd: 'wood', tint: '#c8483c', side: tntTex(false),
+    interact(cell, v) {
+      editBlock(cell[0], cell[1], cell[2], ID_TNT_ARMED + TROT(v) * 256);
+      SFX.fuse();
+      setTimeout(() => explode(cell), 1600);
+    } },
+  { id: 21, name: 'TNT (lit)', snd: 'wood', tint: '#e2a2a2', hidden: true, flash: true, side: tntTex(true) },
 ];
 const TYPE_BY_ID = {}; TYPES.forEach(t => TYPE_BY_ID[t.id] = t);
+const PALETTE = TYPES.filter(t => !t.hidden);
+const ID_DOOR = 13, ID_DOOR_OPEN = 14, ID_TNT = 20, ID_TNT_ARMED = 21;
+// block values pack type + facing: v = typeId + rotation * 256
+const TID = v => v & 255, TROT = v => (v >> 8) & 3;
 
 /* ================= three.js scene ================= */
 const canvas = $('c');
@@ -421,10 +560,56 @@ scene.fog = new THREE.Fog(SKY, 45, 110);
 const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 300);
 camera.rotation.order = 'YXZ';
 
-scene.add(new THREE.HemisphereLight(0xcfe8ff, 0x6a5a40, 0.95));
+const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x6a5a40, 0.95);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff2d0, 0.75);
 sun.position.set(30, 60, 15);
 scene.add(sun);
+
+// day/night (local to each player) + stars
+const DAY_SKY = new THREE.Color('#79b7e8'), NIGHT_SKY = new THREE.Color('#101a2e');
+let nightK = 0, nightTarget = 0;
+const stars = (() => {
+  const pos = [];
+  for (let i = 0; i < 350; i++) {
+    const a = Math.random() * Math.PI * 2, e = Math.random() * Math.PI * 0.48;
+    pos.push(Math.cos(a) * Math.cos(e) * 140, Math.sin(e) * 140 + 5, Math.sin(a) * Math.cos(e) * 140);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  const p = new THREE.Points(g, new THREE.PointsMaterial({
+    color: 0xffffff, size: 2, sizeAttenuation: false, transparent: true, opacity: 0, fog: false,
+  }));
+  scene.add(p);
+  return p;
+})();
+
+// tiny particle bursts (block pops, explosions)
+const PART_GEO = new THREE.BoxGeometry(0.09, 0.09, 0.09);
+const particles = [];
+const BOOM_COLORS = ['#3a3a3a', '#e8a33d', '#d9594c', '#7a7a7a'];
+function burstFX(x, y, z, colors, n, power) {
+  for (let i = 0; i < n; i++) {
+    const m = new THREE.Mesh(PART_GEO, new THREE.MeshBasicMaterial({ color: colors[i % colors.length] }));
+    m.position.set(x + (Math.random() - 0.5) * 0.6, y + (Math.random() - 0.5) * 0.6, z + (Math.random() - 0.5) * 0.6);
+    scene.add(m);
+    particles.push({
+      m, life: 0.7 + Math.random() * 0.4,
+      vx: (Math.random() - 0.5) * power, vy: Math.random() * power * 0.9 + 1, vz: (Math.random() - 0.5) * power,
+    });
+  }
+}
+function tickParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vy -= 16 * dt;
+    p.m.position.x += p.vx * dt; p.m.position.y += p.vy * dt; p.m.position.z += p.vz * dt;
+    if (p.m.position.y < 0.05) { p.m.position.y = 0.05; p.vy *= -0.3; }
+    p.life -= dt;
+    p.m.scale.setScalar(Math.max(0.05, Math.min(1, p.life * 2)));
+    if (p.life <= 0) { scene.remove(p.m); p.m.material.dispose(); particles.splice(i, 1); }
+  }
+}
 
 function tex(cnv) {
   const t = new THREE.CanvasTexture(cnv);
@@ -470,14 +655,20 @@ const clouds = [];
 const MAX_INST = 4000;
 const unitBox = new THREE.BoxGeometry(1, 1, 1);
 const typeMeshes = {}, typeKeys = {};
+const flashMats = [];   // lit-TNT materials, pulsed in the render loop
 for (const t of TYPES) {
-  const side = new THREE.MeshLambertMaterial({ map: tex(t.side) });
-  if (t.transparent) { side.transparent = true; side.opacity = 0.55; }
-  if (t.glow) { side.emissive = new THREE.Color(0xffcc66); side.emissiveIntensity = 0.55; side.emissiveMap = side.map; }
-  const top = t.top ? new THREE.MeshLambertMaterial({ map: tex(t.top) }) : side;
-  const bottom = t.bottom ? new THREE.MeshLambertMaterial({ map: tex(t.bottom) }) : (t.top ? top : side);
-  const mats = [side, side, top, bottom, side, side];
-  const m = new THREE.InstancedMesh(unitBox, mats, MAX_INST);
+  let m;
+  if (t.geo) {
+    m = new THREE.InstancedMesh(t.geo, new THREE.MeshLambertMaterial({ vertexColors: true }), MAX_INST);
+  } else {
+    const side = new THREE.MeshLambertMaterial({ map: tex(t.side) });
+    if (t.transparent) { side.transparent = true; side.opacity = 0.55; }
+    if (t.glow) { side.emissive = new THREE.Color(0xffcc66); side.emissiveIntensity = 0.55; side.emissiveMap = side.map; }
+    if (t.flash) { side.emissive = new THREE.Color(0xffe0b0); side.emissiveIntensity = 0.4; side.emissiveMap = side.map; flashMats.push(side); }
+    const top = t.top ? new THREE.MeshLambertMaterial({ map: tex(t.top) }) : side;
+    const bottom = t.bottom ? new THREE.MeshLambertMaterial({ map: tex(t.bottom) }) : (t.top ? top : side);
+    m = new THREE.InstancedMesh(unitBox, [side, side, top, bottom, side, side], MAX_INST);
+  }
   m.count = 0;
   m.userData.typeId = t.id;
   typeMeshes[t.id] = m; typeKeys[t.id] = [];
@@ -497,18 +688,20 @@ const blocks = new Map();               // "x,y,z" -> typeId
 const recentLocal = new Map();          // key -> {t:ms, v:typeId|0} guards poll races
 const key3 = (x, y, z) => x + ',' + y + ',' + z;
 
+const ROT_MATS = [0, 1, 2, 3].map(r => new THREE.Matrix4().makeRotationY(r * Math.PI / 2));
 function rebuildInstances() {
-  const dummy = new THREE.Matrix4();
+  const m4 = new THREE.Matrix4();
   const lists = {}; for (const t of TYPES) lists[t.id] = [];
-  for (const [k, tid] of blocks) if (lists[tid]) lists[tid].push(k);
+  for (const [k, v] of blocks) { const l = lists[TID(v)]; if (l) l.push([k, TROT(v)]); }
   for (const t of TYPES) {
     const mesh = typeMeshes[t.id], keys = lists[t.id];
     typeKeys[t.id] = keys;
     mesh.count = Math.min(keys.length, MAX_INST);
     for (let i = 0; i < mesh.count; i++) {
-      const [x, y, z] = keys[i].split(',').map(Number);
-      dummy.makeTranslation(x + 0.5, y + 0.5, z + 0.5);
-      mesh.setMatrixAt(i, dummy);
+      const [x, y, z] = keys[i][0].split(',').map(Number);
+      m4.copy(ROT_MATS[keys[i][1]]);
+      m4.setPosition(x + 0.5, y + 0.5, z + 0.5);
+      mesh.setMatrixAt(i, m4);
     }
     mesh.instanceMatrix.needsUpdate = true;
   }
@@ -621,32 +814,71 @@ function publishWorldSoon() {
 /* ---- outgoing ---- */
 function broadcast(msg) { if (channel) { try { channel.postMessage(msg); } catch (e) {} } }
 
-function editBlock(x, y, z, tid) {  // local player action → apply + sync
-  applyOp(x, y, z, tid);
-  recentLocal.set(key3(x, y, z), { t: Date.now(), v: tid });
+function sendOps(ops, extra) {  // local player action(s) → apply + sync
+  for (const [x, y, z, v] of ops) {
+    applyOp(x, y, z, v);
+    recentLocal.set(key3(x, y, z), { t: Date.now(), v });
+  }
   worldStamp = Date.now();
   rebuildInstances();
-  const msg = { type: 'ops', mid: Math.random().toString(36).slice(2), from: session.id, ops: [[x, y, z, tid]] };
+  const msg = Object.assign(
+    { type: 'ops', mid: Math.random().toString(36).slice(2), from: session.id, ops }, extra || {});
   dedup(msg.mid);   // pre-mark so our own broker echo is ignored
   broadcast(msg);
   if (online) { try { mq.publish(T('ops'), JSON.stringify(msg)); } catch (e) {} }
-  else mutateLocalDoc(d => { const k = key3(x, y, z); if (tid) d.b[k] = tid; else delete d.b[k]; });
+  else mutateLocalDoc(d => {
+    for (const [x, y, z, v] of ops) { const k = key3(x, y, z); if (v) d.b[k] = v; else delete d.b[k]; }
+  });
   publishWorldSoon();
   saveCacheSoon();
 }
+function editBlock(x, y, z, v) { sendOps([[x, y, z, v]]); }
+
+function explode(cell) {
+  const [cx, cy, cz] = cell;
+  const cv = blocks.get(key3(cx, cy, cz));
+  if (cv === undefined || TID(cv) !== ID_TNT_ARMED) return;  // defused meanwhile
+  const ops = [], chain = [];
+  for (let x = cx - 3; x <= cx + 3; x++)
+    for (let y = Math.max(0, cy - 3); y <= cy + 3; y++)
+      for (let z = cz - 3; z <= cz + 3; z++) {
+        const v = blocks.get(key3(x, y, z));
+        if (v === undefined) continue;
+        if ((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2 > 6.8) continue;
+        if (TID(v) === ID_TNT) {   // chain reaction: light it instead
+          ops.push([x, y, z, ID_TNT_ARMED + TROT(v) * 256]);
+          chain.push([x, y, z]);
+        } else ops.push([x, y, z, 0]);
+      }
+  sendOps(ops, { boom: [cx, cy, cz] });
+  SFX.boom();
+  burstFX(cx + 0.5, cy + 0.5, cz + 0.5, BOOM_COLORS, 26, 6);
+  for (const c of chain) setTimeout(() => explode(c), 500 + Math.random() * 300);
+}
 
 /* ---- incoming (same handler for broker and BroadcastChannel) ---- */
+function opFx(v) {   // sound for someone else's edit
+  const tid = TID(v);
+  if (!v) SFX.break_('soft');
+  else if (tid === ID_DOOR || tid === ID_DOOR_OPEN) SFX.door(tid === ID_DOOR_OPEN);
+  else if (tid === ID_TNT_ARMED) SFX.fuse();
+  else { const ty = TYPE_BY_ID[tid]; SFX.place(ty ? ty.snd : 'soft'); }
+}
 function handleMsg(m) {
   if (!m || m.from === session.id || dedup(m.mid)) return;
   if (m.type === 'ops' && Array.isArray(m.ops)) {
-    for (const [x, y, z, tid] of m.ops) applyOp(x, y, z, tid);
+    for (const [x, y, z, v] of m.ops) applyOp(x, y, z, v);
     worldStamp = Date.now();
     rebuildInstances();
     saveCacheSoon();
-    const [x, , z, tid] = m.ops[0];
-    const type = TYPE_BY_ID[tid || 1];
-    const dx = x - player.pos.x, dz = z - player.pos.z;   // audible when close by
-    if (dx * dx + dz * dz < 400) { tid ? SFX.place(type.snd) : SFX.break_('soft'); }
+    if (m.boom) {
+      SFX.boom();
+      burstFX(m.boom[0] + 0.5, m.boom[1] + 0.5, m.boom[2] + 0.5, BOOM_COLORS, 26, 6);
+    } else {
+      const [x, , z, v] = m.ops[0];
+      const dx = x - player.pos.x, dz = z - player.pos.z;   // audible when close by
+      if (dx * dx + dz * dz < 400) opFx(v);
+    }
   } else if (m.type === 'pos') {
     setPeer(m.from, m.p);
   }
@@ -906,15 +1138,37 @@ const player = {
   pos: new THREE.Vector3(0.5, 0, 6.5),   // feet
   vel: new THREE.Vector3(),
   yaw: Math.PI, pitch: 0,
-  onGround: true, sel: 0,
+  onGround: true, fly: false, sel: 0,
   W: 0.3, H: 1.8, EYE: 1.62,
 };
 const keys = {};
 let stepDist = 0;
+let jumpHeld = false, descendHeld = false, lastJumpTap = 0;
+
+function setFly(v) {
+  if (player.fly === v) return;
+  player.fly = v;
+  player.vel.y = 0;
+  document.body.classList.toggle('flying', v);
+  SFX.whoosh();
+  toast(v ? 'Flying! Hold jump to rise — double-tap jump or land to stop' : 'Back on foot');
+}
+function tapJump() {   // double-tap jump toggles flying
+  const n = Date.now();
+  if (n - lastJumpTap < 280) { setFly(!player.fly); lastJumpTap = 0; return true; }
+  lastJumpTap = n;
+  return false;
+}
 
 function solid(x, y, z) {
   if (y < 0) return true;
-  return blocks.has(key3(x, y, z));
+  const v = blocks.get(key3(x, y, z));
+  if (v !== undefined) {
+    const ty = TYPE_BY_ID[TID(v)];
+    if (!ty || ty.solid !== false) return true;   // flowers & open doors pass through
+  }
+  const below = blocks.get(key3(x, y - 1, z));    // a closed door fills the cell above too
+  return below !== undefined && TID(below) === ID_DOOR;
 }
 function collides(px, py, pz) {
   const { W, H } = player;
@@ -936,12 +1190,16 @@ function physics(dt) {
   if (len > 1) { fx /= len; fz /= len; }
   // world-space: forward is -Z rotated by yaw
   const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
-  const speed = 5.4;
+  const speed = p.fly ? 8 : 5.4;
   const mvx = (fx * cos + fz * sin) * speed;
   const mvz = (fz * cos - fx * sin) * speed;
   p.vel.x = mvx; p.vel.z = mvz;
-  p.vel.y -= 24 * dt;
-  if ((keys[' '] || jumpQueued) && p.onGround) { p.vel.y = 8.2; p.onGround = false; SFX.jump(); }
+  if (p.fly) {
+    p.vel.y = ((keys[' '] || jumpHeld) ? 5.5 : 0) - ((keys.shift || descendHeld) ? 5.5 : 0);
+  } else {
+    p.vel.y -= 24 * dt;
+    if ((keys[' '] || jumpQueued) && p.onGround) { p.vel.y = 8.2; p.onGround = false; SFX.jump(); }
+  }
   jumpQueued = false;
 
   // integrate per-axis with collision
@@ -953,13 +1211,14 @@ function physics(dt) {
   let ny = p.pos.y + p.vel.y * dt;
   p.onGround = false;
   if (collides(p.pos.x, ny, p.pos.z)) {
-    if (p.vel.y < 0) { p.onGround = true; ny = Math.floor(ny) + 1 + 1e-4; if (!wasGround && p.vel.y < -9) SFX.land(); }
+    if (p.vel.y < 0) { p.onGround = true; ny = Math.floor(ny) + 1 + 1e-4; if (!wasGround && p.vel.y < -9) SFX.land(); if (p.fly) setFly(false); }
     else ny = p.pos.y;
     p.vel.y = 0;
     if (p.onGround && collides(p.pos.x, ny, p.pos.z)) ny = p.pos.y; // safety
     p.pos.y = ny;
   } else p.pos.y = ny;
-  if (p.pos.y < 0) { p.pos.y = 0; p.vel.y = 0; p.onGround = true; }
+  if (p.pos.y < 0) { p.pos.y = 0; p.vel.y = 0; p.onGround = true; if (p.fly) setFly(false); }
+  if (p.fly && p.pos.y > MAX_Y + 6) p.pos.y = MAX_Y + 6;
 
   // keep inside the world square (with a little apron)
   p.pos.x = clamp(p.pos.x, -HALF - 4, HALF + 4);
@@ -996,14 +1255,16 @@ function updateTarget() {
     return;
   }
   const tid = hit.object.userData.typeId;
-  const k = typeKeys[tid][hit.instanceId];
-  if (!k) return;
-  const [bx, by, bz] = k.split(',').map(Number);
+  const entry = typeKeys[tid][hit.instanceId];
+  if (!entry) return;
+  const [bx, by, bz] = entry[0].split(',').map(Number);
   targetBreak = [bx, by, bz];
   highlight.position.set(bx + 0.5, by + 0.5, bz + 0.5);
   highlight.visible = true;
-  const n = hit.face.normal;   // instances are axis-aligned: local == world
-  const cx = bx + n.x, cy = by + n.y, cz = bz + n.z;
+  const m4 = new THREE.Matrix4();
+  hit.object.getMatrixAt(hit.instanceId, m4);
+  const n = hit.face.normal.clone().transformDirection(m4);   // instance may be rotated
+  const cx = bx + Math.round(n.x), cy = by + Math.round(n.y), cz = bz + Math.round(n.z);
   if (inBounds(cx, cy, cz)) targetPlace = [cx, cy, cz];
 }
 
@@ -1014,24 +1275,36 @@ function overlapsPlayer(x, y, z) {
          y + 1 > p.pos.y && y < p.pos.y + p.H;
 }
 function doPlace() {
+  // aiming at something usable (door, TNT)? use it instead of placing
+  if (targetBreak) {
+    const v = blocks.get(key3(...targetBreak));
+    const ty = v !== undefined && TYPE_BY_ID[TID(v)];
+    if (ty && ty.interact) { ty.interact(targetBreak, v); return; }
+  }
   if (!targetPlace) return;
   const [x, y, z] = targetPlace;
+  const below = y > 0 ? blocks.get(key3(x, y - 1, z)) : undefined;
+  if (below !== undefined && TYPE_BY_ID[TID(below)] && TYPE_BY_ID[TID(below)].tall) { SFX.denied(); return; } // a door's top half
   if (blocks.has(key3(x, y, z)) || overlapsPlayer(x, y, z)) { return; }
-  const type = TYPES[player.sel];
-  editBlock(x, y, z, type.id);
+  const type = PALETTE[player.sel];
+  const rot = type.rotates ? ((Math.round(player.yaw / (Math.PI / 2)) % 4 + 6) % 4) : 0; // face the player
+  editBlock(x, y, z, type.id + rot * 256);
   SFX.place(type.snd);
+  burstFX(x + 0.5, y + 0.5, z + 0.5, [type.tint || '#ffffff'], 5, 1.6);
 }
 function doBreak() {
   if (!targetBreak) { SFX.denied(); return; }
   const [x, y, z] = targetBreak;
-  const tid = blocks.get(key3(x, y, z));
+  const v = blocks.get(key3(x, y, z));
   editBlock(x, y, z, 0);
-  SFX.break_(TYPE_BY_ID[tid] ? TYPE_BY_ID[tid].snd : 'soft');
+  const ty = v !== undefined ? TYPE_BY_ID[TID(v)] : null;
+  SFX.break_(ty ? ty.snd : 'soft');
+  burstFX(x + 0.5, y + 0.5, z + 0.5, [(ty && ty.tint) || '#b0a890', '#8a8a8a'], 8, 2.6);
 }
 function doPick() {
   if (!targetBreak) return;
-  const tid = blocks.get(key3(...targetBreak));
-  const i = TYPES.findIndex(t => t.id === tid);
+  const v = blocks.get(key3(...targetBreak));
+  const i = v !== undefined ? PALETTE.findIndex(t => t.id === TID(v)) : -1;
   if (i >= 0) selectSlot(i);
 }
 
@@ -1108,12 +1381,13 @@ document.addEventListener('mouseup', () => {
 document.addEventListener('contextmenu', e => { if (session.joined) e.preventDefault(); });
 document.addEventListener('wheel', e => {
   if (!session.joined) return;
-  selectSlot((player.sel + (e.deltaY > 0 ? 1 : TYPES.length - 1)) % TYPES.length);
+  selectSlot((player.sel + (e.deltaY > 0 ? 1 : PALETTE.length - 1)) % PALETTE.length);
 });
 document.addEventListener('keydown', e => {
   if (!session.joined || e.repeat) return;
   const k = e.key.toLowerCase();
-  if ('wasd '.includes(k)) { keys[k] = true; if (k === ' ') e.preventDefault(); }
+  if ('wasd '.includes(k) || k === 'shift') { keys[k] = true; if (k === ' ') e.preventDefault(); }
+  if (k === ' ') tapJump();
   if (k >= '1' && k <= '9') selectSlot(+k - 1);
   if (k === '0') selectSlot(9);
 });
@@ -1184,7 +1458,18 @@ if (IS_TOUCH) document.body.classList.add('touch');
   document.addEventListener('touchend', endTouch);
   document.addEventListener('touchcancel', endTouch);
 
-  $('jumpBtn').addEventListener('touchstart', e => { e.preventDefault(); e.stopPropagation(); jumpQueued = true; SFX.unlock(); }, { passive: false });
+  $('jumpBtn').addEventListener('touchstart', e => {
+    e.preventDefault(); e.stopPropagation(); SFX.unlock();
+    jumpHeld = true;
+    if (!tapJump() && !player.fly) jumpQueued = true;
+  }, { passive: false });
+  const endJump = () => { jumpHeld = false; };
+  $('jumpBtn').addEventListener('touchend', endJump);
+  $('jumpBtn').addEventListener('touchcancel', endJump);
+  $('downBtn').addEventListener('touchstart', e => { e.preventDefault(); e.stopPropagation(); descendHeld = true; }, { passive: false });
+  const endDown = () => { descendHeld = false; };
+  $('downBtn').addEventListener('touchend', endDown);
+  $('downBtn').addEventListener('touchcancel', endDown);
 })();
 
 /* ================= UI ================= */
@@ -1197,19 +1482,22 @@ function toast(msg) {
 }
 function buildHotbar() {
   const bar = $('hotbar');
-  TYPES.forEach((t, i) => {
+  PALETTE.forEach((t, i) => {
     const slot = document.createElement('div');
     slot.className = 'slot' + (i === 0 ? ' sel' : '');
     slot.setAttribute('role', 'button');
     slot.setAttribute('aria-label', t.name);
-    const k = document.createElement('span');
-    k.className = 'k'; k.textContent = (i + 1) % 10;
+    if (i < 10) {
+      const k = document.createElement('span');
+      k.className = 'k'; k.textContent = (i + 1) % 10;
+      slot.appendChild(k);
+    }
     const icon = document.createElement('canvas');
     icon.width = icon.height = 16;
     const g = icon.getContext('2d');
     g.imageSmoothingEnabled = false;
-    g.drawImage(t.top || t.side, 0, 0);
-    slot.append(k, icon);
+    g.drawImage(t.icon || t.top || t.side, 0, 0);
+    slot.appendChild(icon);
     slot.addEventListener('click', () => selectSlot(i));
     slot.addEventListener('touchstart', e => { e.stopPropagation(); }, { passive: true });
     bar.appendChild(slot);
@@ -1217,9 +1505,12 @@ function buildHotbar() {
 }
 function selectSlot(i) {
   player.sel = i;
-  document.querySelectorAll('.slot').forEach((s, j) => s.classList.toggle('sel', j === i));
+  document.querySelectorAll('.slot').forEach((s, j) => {
+    s.classList.toggle('sel', j === i);
+    if (j === i && s.scrollIntoView) s.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
   const bn = $('blockName');
-  bn.textContent = TYPES[i].name;
+  bn.textContent = PALETTE[i].name;
   bn.style.opacity = 1;
   clearTimeout(bn._t);
   bn._t = setTimeout(() => { bn.style.opacity = 0; }, 1200);
@@ -1340,6 +1631,12 @@ $('copyLink').addEventListener('click', () => {
   else done();
   SFX.click();
 });
+$('nightBtn').addEventListener('click', () => {
+  nightTarget = nightTarget ? 0 : 1;
+  $('nightBtn').innerHTML = nightTarget ? '&#127774;' : '&#127769;';
+  toast(nightTarget ? 'Night falls… lanterns glow' : 'Good morning!');
+  SFX.click();
+});
 $('muteBtn').addEventListener('click', () => {
   const muted = SFX.toggleMute();
   $('muteBtn').innerHTML = muted ? '&#128263;' : '&#128266;';
@@ -1364,6 +1661,16 @@ function frame(t) {
   const dt = Math.min((t - last) / 1000, 0.05);
   last = t;
   for (const c of clouds) { c.position.x += dt * 0.8; if (c.position.x > 130) c.position.x = -130; }
+  tickParticles(dt);
+  if (Math.abs(nightK - nightTarget) > 0.002) {
+    nightK += (nightTarget - nightK) * Math.min(1, dt * 1.6);
+    scene.background.copy(DAY_SKY).lerp(NIGHT_SKY, nightK);
+    scene.fog.color.copy(scene.background);
+    hemi.intensity = 0.95 - 0.6 * nightK;
+    sun.intensity = 0.75 - 0.55 * nightK;
+    stars.material.opacity = nightK;
+  }
+  for (const fm of flashMats) fm.emissiveIntensity = 0.35 + 0.35 * Math.sin(t * 0.014);
   if (session.joined) {
     physics(dt);
     updateTarget();
