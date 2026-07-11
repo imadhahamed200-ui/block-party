@@ -140,6 +140,22 @@
   body.touch #hint{display:none;}
   body.touch #cross{font-size:26px;}
   @media (max-width: 760px){ #hint{display:none;} }
+
+  /* ---- rotate-to-landscape prompt (touch devices in portrait) ---- */
+  #rotate{
+    display:none;position:absolute;inset:0;z-index:40;flex-direction:column;gap:14px;
+    align-items:center;justify-content:center;text-align:center;
+    background:rgba(18,28,44,.93);padding:24px;
+  }
+  #rotate .phone{
+    width:34px;height:58px;border:4px solid var(--cream);border-radius:6px;
+    animation:turnit 1.6s ease-in-out infinite;
+  }
+  @keyframes turnit{0%,25%{transform:rotate(0)}60%,100%{transform:rotate(90deg)}}
+  @media (prefers-reduced-motion: reduce){ #rotate .phone{animation:none;transform:rotate(90deg);} }
+  #rotate h2{font-family:var(--disp);font-size:22px;margin:0;text-shadow:2px 2px 0 var(--umber-deep);}
+  #rotate p{margin:0;font-size:13px;color:var(--cream-dim);line-height:1.6;}
+  @media (orientation: portrait){ body.touch.playing #rotate{display:flex;} }
 </style>
 </head>
 <body>
@@ -190,6 +206,12 @@
   <div id="pause" class="hidden">
     <h2>PAUSED</h2>
     <p>Click to keep building</p>
+  </div>
+
+  <div id="rotate">
+    <div class="phone"></div>
+    <h2>TURN YOUR PHONE SIDEWAYS</h2>
+    <p>Block Party plays in landscape.<br>If nothing happens, switch off your phone&rsquo;s rotation lock.</p>
   </div>
 </div>
 
@@ -1149,6 +1171,20 @@ function randomRoom() {
     const room = roomIn.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
     if (room.length < 2) { $('joinErr').textContent = 'Room code needs at least 2 letters.'; return; }
     SFX.unlock();
+    // phones: go fullscreen and force landscape where the platform allows
+    // (must start inside the tap gesture, before any await)
+    if (IS_TOUCH) {
+      try {
+        const fs = document.documentElement.requestFullscreen &&
+          document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+        if (fs && fs.then) {
+          fs.then(() => {
+            if (screen.orientation && screen.orientation.lock)
+              return screen.orientation.lock('landscape');
+          }).catch(() => {});
+        }
+      } catch (e) {}
+    }
     joining = true;
     $('joinErr').textContent = '';
     $('joinBtn').textContent = 'Connecting…';
@@ -1182,6 +1218,7 @@ function randomRoom() {
     player.yaw = Math.atan2(player.pos.x, player.pos.z); // face the center
 
     session.joined = true;
+    document.body.classList.add('playing');
     $('join').classList.add('hidden');
     $('hud').classList.remove('hidden');
     $('roomCode').textContent = room;
